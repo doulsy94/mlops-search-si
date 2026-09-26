@@ -1,0 +1,53 @@
+name: mlops-search-ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  HELM_DRIVER: configmap
+  KUBE_NAMESPACE: mlops-students
+
+# TODO(student): добавьте concurrency для сериализации deployment.
+
+jobs:
+  test-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python scripts/build_index.py --output artifacts
+      - run: pytest -q
+      - run: python scripts/evaluate.py --artifact-dir artifacts
+      # TODO(student): отрицательный quality control.
+
+  build:
+    needs: test-quality
+    runs-on: ubuntu-latest
+    steps:
+      # TODO(student): checkout, login в GHCR, build/push и output digest.
+      - run: echo TODO
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # TODO(student): kubeconfig из secret, Helm по digest, smoke test и rollback.
+      - run: echo TODO
+
+  promote-production:
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      # TODO(student): тот же digest, manual approval environment, rollback.
+      - run: echo TODO
