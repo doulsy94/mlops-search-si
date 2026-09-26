@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      ranking_mode:
+        description: 'Production ranking mode (use reverse only to test rollback)'
+        required: false
+        default: 'normal'
+        type: choice
+        options: ['normal', 'reverse']
 
 permissions:
   contents: read
@@ -13,8 +20,9 @@ permissions:
 env:
   HELM_DRIVER: configmap
   KUBE_NAMESPACE: mlops-students
-
-# TODO(student): добавьте concurrency для сериализации deployment.
+  STAGING_RELEASE: si-search-staging
+  PROD_RELEASE: si-search-prod
+  IMAGE_REPO: docker.io/doulsy94/runbook-search-api
 
 jobs:
   test-quality:
@@ -28,26 +36,122 @@ jobs:
       - run: python scripts/build_index.py --output artifacts
       - run: pytest -q
       - run: python scripts/evaluate.py --artifact-dir artifacts
-      # TODO(student): отрицательный quality control.
+      - name: Negative quality control (reverse ranking must be blocked)
+        run: |
+          if python scripts/evaluate.py --artifact-dir artifacts --ranking-mode reverse; then
+            echo "ERROR: reverse ranking candidate was NOT blocked"
+            exit 1
+          fi
+          echo "OK: reverse ranking candidate correctly blocked"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quality-report
+          path: artifacts/metadata.json
 
   build:
     needs: test-quality
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
-      # TODO(student): checkout, login в GHCR, build/push и output digest.
-      - run: echo TODO
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_REPO }}:${{ github.sha }}
+      - run: echo "Resolved digest ${{ steps.push.outputs.digest }}"
 
   deploy-staging:
     needs: build
     runs-on: ubuntu-latest
+    concurrency:
+      group: mlops-search-staging
+      cancel-in-progress: false
     steps:
-      # TODO(student): kubeconfig из secret, Helm по digest, smoke test и rollback.
-      - run: echo TODO
+      - uses: actions/checkout@v4
+      - name: Install kubectl and helm
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          curl -LO https://get.helm.sh/helm-v4.1.1-linux-amd64.tar.gz
+          tar -xzf helm-v4.1.1-linux-amd64.tar.gz
+          sudo mv linux-amd64/helm /usr/local/bin/helm
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > ~/.kube/config
+      - name: Deploy to staging
+        run: |
+          helm upgrade --install ${{ env.STAGING_RELEASE }} helm/mlops-search \
+            -n ${{ env.KUBE_NAMESPACE }} \
+            --set image.repository=${{ env.IMAGE_REPO }} \
+            --set image.digest=${{ needs.build.outputs.digest }} \
+            --set environment=staging \
+            --set buildRevision=${{ github.sha }} \
+            --wait --timeout 3m
+      - name: Helm test
+        run: helm test ${{ env.STAGING_RELEASE }} -n ${{ env.KUBE_NAMESPACE }}
+      - name: Semantic smoke test
+        run: python scripts/verify_release.py --release ${{ env.STAGING_RELEASE }} --namespace ${{ env.KUBE_NAMESPACE }}
 
   promote-production:
     needs: [build, deploy-staging]
     runs-on: ubuntu-latest
     environment: production
+    concurrency:
+      group: mlops-search-production
+      cancel-in-progress: false
     steps:
-      # TODO(student): тот же digest, manual approval environment, rollback.
-      - run: echo TODO
+      - uses: actions/checkout@v4
+      - name: Install kubectl and helm
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          curl -LO https://get.helm.sh/helm-v4.1.1-linux-amd64.tar.gz
+          tar -xzf helm-v4.1.1-linux-amd64.tar.gz
+          sudo mv linux-amd64/helm /usr/local/bin/helm
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > ~/.kube/config
+      - name: Record last good revision
+        id: last_good
+        run: |
+          REV=$(helm history ${{ env.PROD_RELEASE }} -n ${{ env.KUBE_NAMESPACE }} -o json 2>/dev/null | jq -r 'if length>0 then .[-1].revision else 0 end')
+          echo "revision=${REV:-0}" >> "$GITHUB_OUTPUT"
+      - name: Deploy to production
+        run: |
+          helm upgrade --install ${{ env.PROD_RELEASE }} helm/mlops-search \
+            -n ${{ env.KUBE_NAMESPACE }} \
+            --set image.repository=${{ env.IMAGE_REPO }} \
+            --set image.digest=${{ needs.build.outputs.digest }} \
+            --set environment=production \
+            --set buildRevision=${{ github.sha }} \
+            --set rankingMode=${{ github.event.inputs.ranking_mode || 'normal' }} \
+            --wait --timeout 3m
+      - name: Helm test
+        run: helm test ${{ env.PROD_RELEASE }} -n ${{ env.KUBE_NAMESPACE }}
+      - name: Semantic smoke test with rollback on failure
+        run: |
+          set +e
+          python scripts/verify_release.py --release ${{ env.PROD_RELEASE }} --namespace ${{ env.KUBE_NAMESPACE }}
+          RESULT=$?
+          set -e
+          if [ $RESULT -ne 0 ]; then
+            echo "Semantic smoke FAILED — rolling back to revision ${{ steps.last_good.outputs.revision }}"
+            helm rollback ${{ env.PROD_RELEASE }} ${{ steps.last_good.outputs.revision }} -n ${{ env.KUBE_NAMESPACE }} --wait --timeout 3m
+            echo "Re-running smoke test after rollback"
+            python scripts/verify_release.py --release ${{ env.PROD_RELEASE }} --namespace ${{ env.KUBE_NAMESPACE }}
+            echo "Rollback verified healthy. Failing job to flag the bad release attempt."
+            exit 1
+          fi
+      - name: Show release history
+        if: always()
+        run: helm history ${{ env.PROD_RELEASE }} -n ${{ env.KUBE_NAMESPACE }}
