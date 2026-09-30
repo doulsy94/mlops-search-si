@@ -35,10 +35,15 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python scripts/build_index.py --output artifacts
       - run: pytest -q
-      - run: python scripts/evaluate.py --artifact-dir artifacts
+      - name: Quality gate (normal ranking)
+        run: python scripts/evaluate.py --artifact-dir artifacts | tee quality-report.json
       - name: Negative quality control (reverse ranking must be blocked)
         run: |
-          if python scripts/evaluate.py --artifact-dir artifacts --ranking-mode reverse; then
+          set +e
+          python scripts/evaluate.py --artifact-dir artifacts --ranking-mode reverse | tee reverse-blocked.json
+          RESULT=${PIPESTATUS[0]}
+          set -e
+          if [ "$RESULT" -eq 0 ]; then
             echo "ERROR: reverse ranking candidate was NOT blocked"
             exit 1
           fi
@@ -46,7 +51,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: quality-report
-          path: artifacts/metadata.json
+          path: |
+            artifacts/metadata.json
+            quality-report.json
+            reverse-blocked.json
 
   build:
     needs: test-quality
